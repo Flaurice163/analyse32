@@ -380,6 +380,7 @@ def appliquer_style():
         [data-testid="stAppDeployButton"],
         [data-testid="stHeaderActionElements"],
         [data-testid="stFooter"],
+        [class*="viewerBadge"],
         #MainMenu,
         footer {
             display: none !important;
