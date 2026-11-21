@@ -8,9 +8,14 @@ create table if not exists public.ventes_workspace (
         check (jsonb_typeof(catalogue_produits) = 'array'),
     objectifs jsonb not null default '[]'::jsonb
         check (jsonb_typeof(objectifs) = 'array'),
+    magasins jsonb not null default '[]'::jsonb
+        check (jsonb_typeof(magasins) = 'array'),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+alter table public.ventes_workspace
+    add column if not exists magasins jsonb not null default '[]'::jsonb;
 
 alter table public.ventes_workspace enable row level security;
 

@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 from datetime import date, datetime, timedelta
 import json
+from urllib.parse import urlsplit, urlunsplit
 from httpx import HTTPError
 from postgrest.exceptions import APIError
 from supabase_auth.errors import AuthError
@@ -18,15 +19,17 @@ st.set_page_config(
 )
 
 TABLE_ESPACE = "ventes_workspace"
-COLONNES_VENTES = ["Magasin", "Mois", "Semaine", "Jour", "Ventes", "Date", "DateVente", "Cout", "Canal"]
+COLONNES_VENTES = ["Magasin", "Mois", "Semaine", "Annee", "Jour", "Ventes", "Date", "DateVente", "Cout", "Canal"]
 COLONNES_PRODUITS = ["DateVente", "Magasin", "Produit", "Categorie", "Quantite", "Prix unitaire", "Canal", "Date"]
 COLONNES_CATALOGUE = ["Produit", "Categorie"]
 COLONNES_OBJECTIFS = ["Magasin", "Mois", "Objectif"]
+COLONNES_MAGASINS = ["Magasin"]
 CHAMPS_ESPACE = {
     "df": ("ventes_journalieres", COLONNES_VENTES),
     "ventes_produits": ("ventes_produits", COLONNES_PRODUITS),
     "catalogue_produits": ("catalogue_produits", COLONNES_CATALOGUE),
     "objectifs": ("objectifs", COLONNES_OBJECTIFS),
+    "magasins": ("magasins", COLONNES_MAGASINS),
 }
 JOURS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 MOIS_FR = [
@@ -71,7 +74,7 @@ def _charger_espace(client: Client, user_id: str):
     )
     resultat = _executer_requete(
         client.table(TABLE_ESPACE)
-        .select("ventes_journalieres, ventes_produits, catalogue_produits, objectifs")
+        .select("ventes_journalieres, ventes_produits, catalogue_produits, objectifs, magasins")
         .eq("user_id", user_id)
         .limit(1)
     )
@@ -112,11 +115,28 @@ def sauvegarder_catalogue(df):
 def sauvegarder_objectifs(df):
     _sauvegarder_section("objectifs", df)
 
+def sauvegarder_magasins(df):
+    _sauvegarder_section("magasins", df)
+
+def lister_magasins():
+    noms = []
+    for source in [
+        st.session_state.magasins["Magasin"],
+        st.session_state.df["Magasin"],
+        st.session_state.ventes_produits["Magasin"],
+    ]:
+        noms.extend(source.dropna().astype(str).str.strip().tolist())
+    uniques = {nom.casefold(): nom for nom in noms if nom}
+    return sorted(uniques.values(), key=str.casefold) or ["Principal"]
+
 def normaliser_ventes(df):
     df = df.copy()
     ventes = pd.to_numeric(df["Ventes"], errors="coerce")
     invalides = df["Ventes"].notna() & ventes.isna()
     df["Ventes"] = ventes
+    dates = pd.to_datetime(df["DateVente"], errors="coerce")
+    annees = pd.to_numeric(df["Annee"], errors="coerce")
+    df["Annee"] = dates.dt.year.fillna(annees).astype("Int64")
     return df, int(invalides.sum())
 
 def construire_journal(df, ventes_produits):
@@ -156,6 +176,7 @@ def construire_journal(df, ventes_produits):
             resume["Semaine"] = resume["DateVente"].apply(
                 lambda valeur: f"S{valeur.isocalendar().week}"
             )
+            resume["Annee"] = resume["DateVente"].dt.year
             resume["Jour"] = resume["DateVente"].dt.day_name()
             jours_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
             traductions = dict(zip(jours_en, JOURS))
@@ -258,6 +279,7 @@ def valider_import_journal(import_df, existants):
         erreurs.append(f"{int(dates_invalides.sum())} date(s) de vente invalide(s).")
         lignes_invalides |= dates_invalides
     resultat["DateVente"] = dates.dt.strftime("%Y-%m-%d")
+    resultat["Annee"] = dates.dt.year
     resultat = resultat.loc[~lignes_invalides].copy()
     resultat["Date"] = resultat["Date"].fillna(datetime.now().strftime("%Y-%m-%d %H:%M"))
     resultat = resultat[COLONNES_VENTES]
@@ -439,86 +461,253 @@ client = st.session_state.get("supabase_client")
 if client is None:
     client = _creer_client_supabase()
 
+def _url_application():
+    try:
+        url_configuree = str(st.secrets["app"]["public_url"]).strip()
+    except (KeyError, StreamlitSecretNotFoundError):
+        url_configuree = st.context.url
+    morceaux = urlsplit(url_configuree)
+    if morceaux.scheme not in {"http", "https"} or not morceaux.netloc:
+        st.error(
+            "L’adresse publique de l’application est invalide. "
+            "Configurez `[app].public_url` dans `.streamlit/secrets.toml`."
+        )
+        st.stop()
+    return urlunsplit((morceaux.scheme, morceaux.netloc, morceaux.path, "", ""))
+
+def _ouvrir_session(resultat_auth, email):
+    if resultat_auth.user is None or resultat_auth.session is None:
+        st.error("Supabase n’a pas ouvert de session. Vérifiez votre adresse e-mail.")
+        return False
+    st.session_state.supabase_client = client
+    st.session_state.supabase_user = {
+        "id": resultat_auth.user.id,
+        "email": resultat_auth.user.email or email,
+    }
+    return True
+
+type_retour = st.query_params.get("type", "")
+token_hash = st.query_params.get("token_hash", "")
+if token_hash and type_retour == "recovery":
+    try:
+        resultat_auth = client.auth.verify_otp(
+            {"token_hash": token_hash, "type": "recovery"}
+        )
+    except (AuthError, HTTPError) as erreur:
+        st.error(f"Le lien de réinitialisation est invalide ou expiré : {erreur}")
+        st.query_params.clear()
+        st.stop()
+    if _ouvrir_session(resultat_auth, resultat_auth.user.email if resultat_auth.user else ""):
+        st.session_state.mode_reinitialisation_mdp = True
+        st.session_state.page = "Paramètres"
+        st.query_params.clear()
+        st.rerun()
+
 if "supabase_user" not in st.session_state:
-    st.title("Connexion à Analyse PME")
-    st.caption("Connectez-vous pour consulter votre espace privé d’analyse des ventes.")
-    onglet_connexion, onglet_inscription = st.tabs(["Connexion", "Créer un compte"])
-
-    with onglet_connexion:
-        with st.form("formulaire_connexion"):
-            email_connexion = st.text_input("Adresse e-mail", key="email_connexion")
-            mot_de_passe = st.text_input(
-                "Mot de passe", type="password", key="mot_de_passe_connexion"
-            )
-            connexion = st.form_submit_button(
-                "Se connecter", type="primary", icon=":material/login:"
-            )
-        if connexion:
-            try:
-                resultat_auth = client.auth.sign_in_with_password(
-                    {"email": email_connexion.strip(), "password": mot_de_passe}
+    _, colonne_auth, _ = st.columns([1, 1.15, 1])
+    with colonne_auth:
+        st.markdown(
+            """
+            <style>
+            [data-testid="stMainBlockContainer"] {
+                max-width: 1100px;
+                padding-top: 2rem;
+            }
+            [data-testid="stForm"] {
+                padding: 1.25rem;
+                border: 1px solid #293241;
+                border-radius: 1rem;
+                background: linear-gradient(145deg, #151a23, #10141c);
+            }
+            [data-testid="stButton"] button {
+                min-height: 2.8rem;
+                border-radius: .7rem;
+            }
+            @media (max-width: 640px) {
+                [data-testid="stMainBlockContainer"] {
+                    padding: 1rem .75rem 2rem;
+                }
+                [data-testid="stForm"] {
+                    padding: 1rem;
+                }
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div style="text-align:center; padding: 2rem 1.5rem 1.6rem;
+                 margin-bottom:1.2rem; border:1px solid #293241; border-radius:1.2rem;
+                 background:radial-gradient(ellipse at top, #1d3554 0%, #111722 65%);">
+                <div style="display:inline-flex; align-items:center; gap:.6rem;
+                     color:#93c5fd; font-weight:700; letter-spacing:.12em;
+                     font-size:.8rem;">
+                    <span class="material-symbols-rounded">monitoring</span>
+                    ANALYSE PME
+                </div>
+                <h1 style="font-size:2.4rem; margin:.8rem 0 .35rem;">
+                    Vos ventes, en perspective.
+                </h1>
+                <p style="color:#aab4c3; margin:0;">
+                    Un espace sécurisé pour comprendre vos résultats et piloter votre activité.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        mode_auth = st.session_state.setdefault("mode_auth", "connexion")
+        if mode_auth == "connexion":
+            st.markdown("#### Bon retour")
+            st.caption("Connectez-vous à votre espace d’analyse.")
+            with st.form("formulaire_connexion"):
+                email_connexion = st.text_input(
+                    "Adresse e-mail", key="email_connexion"
                 )
-            except (AuthError, HTTPError) as erreur:
-                st.error(f"Connexion impossible : {erreur}")
-            else:
-                if resultat_auth.user is None:
-                    st.error("Supabase n’a pas retourné de compte utilisateur.")
-                else:
-                    st.session_state.supabase_client = client
-                    st.session_state.supabase_user = {
-                        "id": resultat_auth.user.id,
-                        "email": resultat_auth.user.email or email_connexion.strip(),
-                    }
-                    st.rerun()
-
-    with onglet_inscription:
-        with st.form("formulaire_inscription"):
-            email_inscription = st.text_input("Adresse e-mail", key="email_inscription")
-            mot_de_passe_inscription = st.text_input(
-                "Mot de passe (8 caractères minimum)",
-                type="password",
-                key="mot_de_passe_inscription",
-            )
-            confirmation_mot_de_passe = st.text_input(
-                "Confirmer le mot de passe",
-                type="password",
-                key="confirmation_mot_de_passe",
-            )
-            inscription = st.form_submit_button(
-                "Créer mon compte", type="primary", icon=":material/person_add:"
-            )
-        if inscription:
-            if len(mot_de_passe_inscription) < 8:
-                st.error("Le mot de passe doit contenir au moins 8 caractères.")
-            elif mot_de_passe_inscription != confirmation_mot_de_passe:
-                st.error("Les deux mots de passe ne correspondent pas.")
-            elif not email_inscription.strip():
-                st.error("L’adresse e-mail est obligatoire.")
-            else:
+                mot_de_passe = st.text_input(
+                    "Mot de passe",
+                    type="password",
+                    key="mot_de_passe_connexion",
+                )
+                connexion = st.form_submit_button(
+                    "Se connecter",
+                    type="primary",
+                    icon=":material/login:",
+                    use_container_width=True,
+                )
+            if connexion:
                 try:
-                    resultat_auth = client.auth.sign_up(
-                        {
-                            "email": email_inscription.strip(),
-                            "password": mot_de_passe_inscription,
-                        }
+                    resultat_auth = client.auth.sign_in_with_password(
+                        {"email": email_connexion.strip(), "password": mot_de_passe}
                     )
                 except (AuthError, HTTPError) as erreur:
-                    st.error(f"Création du compte impossible : {erreur}")
+                    st.error(f"Connexion impossible : {erreur}")
                 else:
-                    if resultat_auth.user is None:
-                        st.error("Supabase n’a pas retourné de compte utilisateur.")
-                    elif resultat_auth.session is None:
-                        st.success(
-                            "Compte créé. Confirmez votre adresse e-mail depuis le message "
-                            "de Supabase, puis connectez-vous."
-                        )
-                    else:
-                        st.session_state.supabase_client = client
-                        st.session_state.supabase_user = {
-                            "id": resultat_auth.user.id,
-                            "email": resultat_auth.user.email or email_inscription.strip(),
-                        }
+                    if _ouvrir_session(resultat_auth, email_connexion.strip()):
                         st.rerun()
+            st.divider()
+            st.caption("Vous n’avez pas encore de compte ?")
+            if st.button(
+                "Créer un compte",
+                icon=":material/person_add:",
+                use_container_width=True,
+                key="ouvrir_inscription",
+            ):
+                st.session_state.mode_auth = "inscription"
+                st.rerun()
+            if st.button(
+                "Mot de passe oublié ?",
+                icon=":material/lock_reset:",
+                use_container_width=True,
+                key="ouvrir_mdp_oublie",
+            ):
+                st.session_state.mode_auth = "mdp_oublie"
+                st.rerun()
+
+        elif mode_auth == "inscription":
+            st.markdown("#### Créer votre espace")
+            st.caption("Vos données resteront privées à votre compte.")
+            with st.form("formulaire_inscription"):
+                email_inscription = st.text_input(
+                    "Adresse e-mail", key="email_inscription"
+                )
+                mot_de_passe_inscription = st.text_input(
+                    "Mot de passe (8 caractères minimum)",
+                    type="password",
+                    key="mot_de_passe_inscription",
+                )
+                confirmation_mot_de_passe = st.text_input(
+                    "Confirmer le mot de passe",
+                    type="password",
+                    key="confirmation_mot_de_passe",
+                )
+                inscription = st.form_submit_button(
+                    "Créer mon compte",
+                    type="primary",
+                    icon=":material/person_add:",
+                    use_container_width=True,
+                )
+            if inscription:
+                if len(mot_de_passe_inscription) < 8:
+                    st.error("Le mot de passe doit contenir au moins 8 caractères.")
+                elif mot_de_passe_inscription != confirmation_mot_de_passe:
+                    st.error("Les deux mots de passe ne correspondent pas.")
+                elif not email_inscription.strip():
+                    st.error("L’adresse e-mail est obligatoire.")
+                else:
+                    try:
+                        resultat_auth = client.auth.sign_up(
+                            {
+                                "email": email_inscription.strip(),
+                                "password": mot_de_passe_inscription,
+                            }
+                        )
+                    except (AuthError, HTTPError) as erreur:
+                        st.error(f"Création du compte impossible : {erreur}")
+                    else:
+                        if resultat_auth.user is None:
+                            st.error("Supabase n’a pas retourné de compte utilisateur.")
+                        elif resultat_auth.session is None:
+                            st.success(
+                                "Compte créé. Confirmez votre adresse e-mail depuis "
+                                "le message envoyé par Supabase, puis connectez-vous."
+                            )
+                        elif _ouvrir_session(resultat_auth, email_inscription.strip()):
+                            st.rerun()
+            st.divider()
+            if st.button(
+                "Retour à la connexion",
+                icon=":material/arrow_back:",
+                use_container_width=True,
+                key="retour_connexion_inscription",
+            ):
+                st.session_state.mode_auth = "connexion"
+                st.rerun()
+
+        else:
+            st.markdown("#### Réinitialiser votre mot de passe")
+            st.caption(
+                "Nous vous enverrons un lien sécurisé pour choisir un nouveau mot de passe."
+            )
+            with st.form("formulaire_mdp_oublie"):
+                email_reinitialisation = st.text_input(
+                    "Adresse e-mail du compte", key="email_reinitialisation"
+                )
+                demander_reinitialisation = st.form_submit_button(
+                    "Envoyer le lien de réinitialisation",
+                    type="primary",
+                    icon=":material/lock_reset:",
+                    use_container_width=True,
+                )
+            if demander_reinitialisation:
+                if not email_reinitialisation.strip():
+                    st.error("Saisissez l’adresse e-mail de votre compte.")
+                else:
+                    try:
+                        client.auth.reset_password_for_email(
+                            email_reinitialisation.strip(),
+                            {"redirect_to": _url_application()},
+                        )
+                    except (AuthError, HTTPError) as erreur:
+                        st.error(f"Envoi du lien impossible : {erreur}")
+                    else:
+                        st.success(
+                            "Si cette adresse correspond à un compte, un e-mail "
+                            "de réinitialisation vient d’être envoyé."
+                        )
+                        st.info(
+                            "Ouvrez le lien, puis définissez votre nouveau mot de passe "
+                            "dans la page qui s’affichera."
+                        )
+            st.divider()
+            if st.button(
+                "Retour à la connexion",
+                icon=":material/arrow_back:",
+                use_container_width=True,
+                key="retour_connexion_mdp_oublie",
+            ):
+                st.session_state.mode_auth = "connexion"
+                st.rerun()
     st.stop()
 
 utilisateur = st.session_state.supabase_user
@@ -527,7 +716,11 @@ if st.session_state.get("workspace_user_id") != utilisateur["id"]:
     for cle, donnees in espace.items():
         st.session_state[cle] = donnees
     st.session_state.workspace_user_id = utilisateur["id"]
-    st.session_state.page = "Tableau de bord"
+    st.session_state.page = (
+        "Paramètres"
+        if st.session_state.get("mode_reinitialisation_mdp")
+        else "Tableau de bord"
+    )
 
 for colonne in COLONNES_VENTES:
     if colonne not in st.session_state.df:
@@ -553,6 +746,7 @@ PAGES = [
     ("Analyses", ":material/query_stats:"),
     ("Prévisions", ":material/show_chart:"),
     ("Import / Export", ":material/import_export:"),
+    ("Paramètres", ":material/settings:"),
 ]
 
 if "page" not in st.session_state:
@@ -594,6 +788,14 @@ page = st.session_state.page
 if page == "Tableau de bord":
     st.title("Vue d’ensemble des ventes")
     st.caption("Analysez les tendances, comparez les périodes et suivez la performance commerciale.")
+    confirmation_dashboard = st.session_state.pop(
+        "confirmation_saisie_dashboard", None
+    )
+    if confirmation_dashboard and confirmation_dashboard["user_id"] == utilisateur["id"]:
+        st.success(confirmation_dashboard["message"])
+    confirmation_securite = st.session_state.pop("confirmation_securite", None)
+    if confirmation_securite:
+        st.success(confirmation_securite)
     
     magasins = sorted(journal["Magasin"].dropna().astype(str).unique())
     mois_disponibles = sorted(journal["Mois"].dropna().astype(str).unique())
@@ -638,7 +840,7 @@ if page == "Tableau de bord":
 
         hebdomadaire = (
             donnees.groupby(
-                ["Magasin", "Mois", "Semaine"], as_index=False, dropna=False
+                ["Magasin", "Mois", "Annee", "Semaine"], as_index=False, dropna=False
             )["Ventes"]
             .sum()
             .rename(columns={"Ventes": "Total semaine"})
@@ -681,7 +883,7 @@ if page == "Tableau de bord":
                 icon=":material/trending_down:",
             )
             st.dataframe(
-                alertes[["Magasin", "Mois", "Semaine", "Total semaine", "Évolution (%)"]],
+                alertes[["Magasin", "Mois", "Annee", "Semaine", "Total semaine", "Évolution (%)"]],
                 hide_index=True,
                 width="stretch",
             )
@@ -711,7 +913,7 @@ if page == "Tableau de bord":
 
         st.subheader("Résumé hebdomadaire")
         st.dataframe(
-            hebdomadaire[["Magasin", "Mois", "Semaine", "Total semaine", "Évolution (%)"]],
+            hebdomadaire[["Magasin", "Mois", "Annee", "Semaine", "Total semaine", "Évolution (%)"]],
             hide_index=True,
             width="stretch",
         )
@@ -721,42 +923,96 @@ elif page == "Saisie des ventes":
     st.caption("Enregistrez les totaux journaliers ou détaillez les ventes par produit.")
     tab_jour, tab_produit = st.tabs(["Totaux journaliers", "Lignes par produit"])
 
-    with tab_jour:
-        col_magasin, col_date = st.columns(2)
-        with col_magasin:
-            magasin = st.text_input("Magasin", "Principal", key="hebdo_magasin")
-        with col_date:
-            lundi_defaut = date.today() - timedelta(days=date.today().weekday())
-            lundi = st.date_input("Lundi de la semaine", value=lundi_defaut, key="hebdo_date")
-        debut_semaine = lundi - timedelta(days=lundi.weekday())
-        semaine = f"S{debut_semaine.isocalendar().week}"
-        mois = f"{MOIS_FR[debut_semaine.month - 1]} {debut_semaine.year}"
-        st.caption(f"Période reconnue : {mois}, {semaine}")
-
-        st.subheader("Chiffre d’affaires et coûts par jour")
-        suivre_couts = st.checkbox(
-            "Renseigner les coûts quotidiens pour estimer la rentabilité",
-            key="saisie_suivre_couts",
-        )
-        colonnes_jours = st.columns(4)
-        ventes, couts = [], []
-        for index, jour in enumerate(JOURS):
-            with colonnes_jours[index % 4]:
-                st.markdown(f"**{jour} · {(debut_semaine + timedelta(days=index)).strftime('%d/%m')}**")
-                ventes.append(st.number_input(
-                    f"Ventes (€) · {jour}", min_value=0.0, value=0.0,
-                    step=50.0, key=f"vente_jour_{index}",
-                ))
-                couts.append(
-                    st.number_input(
-                        f"Coûts (€) · {jour}", min_value=0.0, value=0.0,
-                        step=10.0, key=f"cout_jour_{index}",
-                    )
-                    if suivre_couts
-                    else None
+    generation_magasin = st.session_state.get("generation_magasin", 0)
+    with st.expander("Ajouter une boutique ou un magasin"):
+        with st.form("formulaire_ajout_magasin", clear_on_submit=True):
+            nouveau_magasin = st.text_input(
+                "Nom de la boutique ou du magasin",
+                key=f"nouveau_magasin_{utilisateur['id']}_{generation_magasin}",
+            )
+            ajouter_magasin = st.form_submit_button(
+                "Ajouter le magasin", icon=":material/store:"
+            )
+        if ajouter_magasin:
+            nom_magasin = nouveau_magasin.strip()
+            if not nom_magasin:
+                st.error("Le nom du magasin est obligatoire.")
+            elif any(
+                nom.casefold() == nom_magasin.casefold()
+                for nom in lister_magasins()
+            ):
+                st.error("Ce magasin existe déjà.")
+            else:
+                st.session_state.magasins = pd.concat(
+                    [
+                        st.session_state.magasins,
+                        pd.DataFrame([{"Magasin": nom_magasin}]),
+                    ],
+                    ignore_index=True,
                 )
+                sauvegarder_magasins(st.session_state.magasins)
+                st.session_state.generation_magasin = generation_magasin + 1
+                st.success(f"Magasin « {nom_magasin} » ajouté.")
+                st.rerun()
 
-        if st.button("Enregistrer la semaine", type="primary", icon=":material/save:", key="enregistrer_semaine"):
+    with tab_jour:
+        generation_semaine = st.session_state.get("generation_saisie_semaine", 0)
+        prefixe_semaine = f"{utilisateur['id']}_{generation_semaine}"
+        with st.form("formulaire_totaux_journaliers", clear_on_submit=True):
+            col_magasin, col_date = st.columns(2)
+            with col_magasin:
+                magasins_disponibles = lister_magasins()
+                magasin = st.selectbox(
+                    "Magasin",
+                    magasins_disponibles,
+                    key=f"hebdo_magasin_{prefixe_semaine}",
+                )
+            with col_date:
+                lundi_defaut = date.today() - timedelta(days=date.today().weekday())
+                lundi = st.date_input(
+                    "Date de la semaine",
+                    value=lundi_defaut,
+                    key=f"hebdo_date_{prefixe_semaine}",
+                    help="La date choisie sera automatiquement ramenée au lundi de sa semaine.",
+                )
+            debut_semaine = lundi - timedelta(days=lundi.weekday())
+            fin_semaine = debut_semaine + timedelta(days=6)
+            periode_iso = debut_semaine.isocalendar()
+            st.caption(
+                f"Semaine ISO S{periode_iso.week:02d} · {periode_iso.year} "
+                f"— du {debut_semaine:%d/%m/%Y} au {fin_semaine:%d/%m/%Y}"
+            )
+
+            st.subheader("Chiffre d’affaires et coûts par jour")
+            suivre_couts = st.checkbox(
+                "Renseigner les coûts quotidiens pour estimer la rentabilité",
+                key=f"saisie_suivre_couts_{prefixe_semaine}",
+            )
+            colonnes_jours = st.columns(4)
+            ventes, couts = [], []
+            for index, jour in enumerate(JOURS):
+                date_jour = debut_semaine + timedelta(days=index)
+                with colonnes_jours[index % 4]:
+                    st.markdown(f"**{jour} · {date_jour:%d/%m/%Y}**")
+                    ventes.append(st.number_input(
+                        f"Ventes (€) · {jour}", min_value=0.0, value=0.0,
+                        step=50.0, key=f"vente_jour_{prefixe_semaine}_{index}",
+                    ))
+                    couts.append(
+                        st.number_input(
+                            f"Coûts (€) · {jour}", min_value=0.0, value=0.0,
+                            step=10.0, key=f"cout_jour_{prefixe_semaine}_{index}",
+                        )
+                        if suivre_couts
+                        else None
+                    )
+            enregistrer_semaine = st.form_submit_button(
+                "Enregistrer la semaine",
+                type="primary",
+                icon=":material/save:",
+            )
+
+        if enregistrer_semaine:
             dates_vente = [(debut_semaine + timedelta(days=index)).isoformat() for index in range(7)]
             deja_saisies = st.session_state.df[
                 st.session_state.df["Magasin"].astype(str).eq(magasin.strip())
@@ -767,10 +1023,14 @@ elif page == "Saisie des ventes":
             elif not deja_saisies.empty:
                 st.error("Une ou plusieurs journées de cette semaine existent déjà pour ce magasin. Modifiez-les dans Données.")
             else:
+                dates_jour = [debut_semaine + timedelta(days=index) for index in range(7)]
                 nouvelles = pd.DataFrame({
                     "Magasin": [magasin.strip()] * 7,
-                    "Mois": [mois] * 7,
-                    "Semaine": [semaine] * 7,
+                    "Mois": [
+                        f"{MOIS_FR[jour.month - 1]} {jour.year}" for jour in dates_jour
+                    ],
+                    "Semaine": [f"S{jour.isocalendar().week}" for jour in dates_jour],
+                    "Annee": [jour.year for jour in dates_jour],
                     "Jour": JOURS,
                     "Ventes": ventes,
                     "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -782,16 +1042,55 @@ elif page == "Saisie des ventes":
                     [st.session_state.df, nouvelles], ignore_index=True
                 )
                 sauvegarder_donnees(st.session_state.df)
-                st.success(f"Semaine {semaine} enregistrée.")
+                st.session_state.derniere_semaine_enregistree = {
+                    "user_id": utilisateur["id"],
+                    "magasin": magasin,
+                    "semaine": periode_iso.week,
+                    "annee_iso": periode_iso.year,
+                    "debut": debut_semaine.isoformat(),
+                    "fin": fin_semaine.isoformat(),
+                    "lignes": nouvelles[
+                        ["DateVente", "Jour", "Mois", "Semaine", "Annee", "Ventes"]
+                    ].to_dict("records"),
+                }
+                st.session_state.confirmation_saisie_dashboard = {
+                    "user_id": utilisateur["id"],
+                    "message": (
+                        f"Semaine ISO S{periode_iso.week:02d} · {periode_iso.year} "
+                        f"enregistrée pour « {magasin} » "
+                        f"(du {debut_semaine:%d/%m/%Y} au {fin_semaine:%d/%m/%Y})."
+                    ),
+                }
+                st.session_state.generation_saisie_semaine = generation_semaine + 1
+                st.session_state.page = "Tableau de bord"
                 st.rerun()
+
+        confirmation_semaine = st.session_state.get("derniere_semaine_enregistree")
+        if confirmation_semaine and confirmation_semaine["user_id"] == utilisateur["id"]:
+            debut_enregistre = date.fromisoformat(confirmation_semaine["debut"])
+            fin_enregistree = date.fromisoformat(confirmation_semaine["fin"])
+            st.success(
+                f"Semaine ISO S{confirmation_semaine['semaine']:02d} · "
+                f"{confirmation_semaine['annee_iso']} enregistrée pour "
+                f"« {confirmation_semaine['magasin']} » "
+                f"(du {debut_enregistre:%d/%m/%Y} au {fin_enregistree:%d/%m/%Y})."
+            )
+            st.dataframe(
+                pd.DataFrame(confirmation_semaine["lignes"]),
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "DateVente": st.column_config.TextColumn("Date de vente"),
+                    "Annee": st.column_config.NumberColumn("Année"),
+                    "Ventes": st.column_config.NumberColumn("Ventes (€)", format="%.2f"),
+                },
+            )
 
     with tab_produit:
         catalogue = st.session_state.catalogue_produits
-        magasins_connus = sorted(
-            set(st.session_state.df["Magasin"].dropna().astype(str))
-            | set(ventes_produits["Magasin"].dropna().astype(str))
-        )
-        magasins_connus = magasins_connus or ["Principal"]
+        magasins_connus = lister_magasins()
+        generation_produit = st.session_state.get("generation_saisie_produit", 0)
+        prefixe_produit = f"{utilisateur['id']}_{generation_produit}"
         with st.expander("Gérer le catalogue produits"):
             with st.form("ajouter_produit_catalogue"):
                 nouveau_produit = st.text_input("Nom du produit")
@@ -844,21 +1143,50 @@ elif page == "Saisie des ventes":
         if catalogue.empty:
             st.info("Ajoutez d’abord un produit au catalogue pour saisir une vente détaillée.")
         else:
-            with st.form("saisie_ligne_produit"):
+            with st.form("saisie_ligne_produit", clear_on_submit=True):
                 p1, p2, p3 = st.columns(3)
                 with p1:
-                    date_produit = st.date_input("Date de vente", value=date.today())
-                    magasin_produit = st.selectbox("Magasin", magasins_connus)
+                    date_produit = st.date_input(
+                        "Date de vente",
+                        value=date.today(),
+                        key=f"date_produit_{prefixe_produit}",
+                    )
+                    magasin_produit = st.selectbox(
+                        "Magasin",
+                        magasins_connus,
+                        key=f"magasin_produit_{prefixe_produit}",
+                    )
                 with p2:
-                    produit = st.selectbox("Produit", catalogue["Produit"].astype(str).tolist())
-                    quantite = st.number_input("Quantité", min_value=0.01, value=1.0, step=1.0)
+                    produit = st.selectbox(
+                        "Produit",
+                        catalogue["Produit"].astype(str).tolist(),
+                        key=f"produit_{prefixe_produit}",
+                    )
+                    quantite = st.number_input(
+                        "Quantité",
+                        min_value=0.01,
+                        value=1.0,
+                        step=1.0,
+                        key=f"quantite_{prefixe_produit}",
+                    )
                 with p3:
-                    prix_unitaire = st.number_input("Prix unitaire (€)", min_value=0.0, value=0.0, step=1.0)
+                    prix_unitaire = st.number_input(
+                        "Prix unitaire (€)",
+                        min_value=0.0,
+                        value=0.0,
+                        step=1.0,
+                        key=f"prix_unitaire_{prefixe_produit}",
+                    )
                     canal_selection = st.selectbox(
-                        "Canal de vente", ["Boutique", "E-commerce", "Téléphone", "Autre"]
+                        "Canal de vente",
+                        ["Boutique", "E-commerce", "Téléphone", "Autre"],
+                        key=f"canal_selection_{prefixe_produit}",
                     )
                 canal = (
-                    st.text_input("Précisez le canal")
+                    st.text_input(
+                        "Précisez le canal",
+                        key=f"canal_autre_{prefixe_produit}",
+                    )
                     if canal_selection == "Autre"
                     else canal_selection
                 )
@@ -880,8 +1208,43 @@ elif page == "Saisie des ventes":
                     [ventes_produits, nouvelle_ligne], ignore_index=True
                 )
                 sauvegarder_ventes_produits(st.session_state.ventes_produits)
-                st.success("Ligne de vente produit enregistrée.")
+                periode_produit = date_produit.isocalendar()
+                st.session_state.derniere_vente_produit_enregistree = {
+                    "user_id": utilisateur["id"],
+                    "produit": produit,
+                    "date": date_produit.isoformat(),
+                    "mois": f"{MOIS_FR[date_produit.month - 1]} {date_produit.year}",
+                    "semaine": periode_produit.week,
+                    "annee_iso": periode_produit.year,
+                }
+                st.session_state.confirmation_saisie_dashboard = {
+                    "user_id": utilisateur["id"],
+                    "message": (
+                        f"Vente de « {produit} » enregistrée le "
+                        f"{date_produit:%d/%m/%Y} — {MOIS_FR[date_produit.month - 1]} "
+                        f"{date_produit.year}, semaine ISO S{periode_produit.week:02d} "
+                        f"· {periode_produit.year}."
+                    ),
+                }
+                st.session_state.generation_saisie_produit = generation_produit + 1
+                st.session_state.page = "Tableau de bord"
                 st.rerun()
+            confirmation_produit = st.session_state.get(
+                "derniere_vente_produit_enregistree"
+            )
+            if (
+                confirmation_produit
+                and confirmation_produit["user_id"] == utilisateur["id"]
+            ):
+                st.success(
+                    f"Vente de « {confirmation_produit['produit']} » enregistrée "
+                    f"le {date.fromisoformat(confirmation_produit['date']):%d/%m/%Y}."
+                )
+                st.caption(
+                    f"Période : {confirmation_produit['mois']} · "
+                    f"Semaine ISO S{confirmation_produit['semaine']:02d} · "
+                    f"{confirmation_produit['annee_iso']}."
+                )
 
 # ===================== GESTION SIMPLE DES DONNÉES =====================
 elif page == "Données importées":
@@ -905,7 +1268,7 @@ elif page == "Données importées":
                 with st.expander("Examiner les doublons potentiels"):
                     st.dataframe(
                         doublons_existants[
-                            ["Magasin", "Mois", "Semaine", "Jour", "Ventes", "DateVente"]
+                            ["Magasin", "Mois", "Annee", "Semaine", "Jour", "Ventes", "DateVente"]
                         ],
                         hide_index=True,
                         width="stretch",
@@ -927,6 +1290,7 @@ elif page == "Données importées":
                     "Ventes": st.column_config.NumberColumn("Ventes (€)", format="%.2f"),
                     "Cout": st.column_config.NumberColumn("Coûts (€)", format="%.2f"),
                     "DateVente": st.column_config.DateColumn("Date de vente"),
+                    "Annee": st.column_config.NumberColumn("Année"),
                     "Date": st.column_config.TextColumn("Date de saisie", disabled=True),
                 },
                 key="editor",
@@ -1499,3 +1863,71 @@ elif page == "Import / Export":
             mime="text/csv",
             icon=":material/download:",
         )
+
+# ===================== PARAMÈTRES DU COMPTE =====================
+elif page == "Paramètres":
+    st.title("Paramètres du compte")
+    st.caption("Gérez les paramètres de sécurité de votre compte Analyse PME.")
+
+    mode_reinitialisation = st.session_state.get("mode_reinitialisation_mdp", False)
+    if mode_reinitialisation:
+        st.info("Choisissez un nouveau mot de passe pour terminer la réinitialisation.")
+    else:
+        st.markdown(f"Compte connecté : **{utilisateur['email']}**")
+
+    with st.container(border=True):
+        st.subheader("Sécurité")
+        st.markdown("#### Modifier le mot de passe")
+        with st.form("formulaire_modification_mot_de_passe"):
+            if not mode_reinitialisation:
+                mot_de_passe_actuel = st.text_input(
+                    "Mot de passe actuel",
+                    type="password",
+                    key="mot_de_passe_actuel",
+                )
+            nouveau_mot_de_passe = st.text_input(
+                "Nouveau mot de passe (8 caractères minimum)",
+                type="password",
+                key="nouveau_mot_de_passe",
+            )
+            confirmation_nouveau_mot_de_passe = st.text_input(
+                "Confirmer le nouveau mot de passe",
+                type="password",
+                key="confirmation_nouveau_mot_de_passe",
+            )
+            modifier_mot_de_passe = st.form_submit_button(
+                "Enregistrer le nouveau mot de passe",
+                type="primary",
+                icon=":material/lock_reset:",
+            )
+
+        if modifier_mot_de_passe:
+            if not mode_reinitialisation and not mot_de_passe_actuel:
+                st.error("Saisissez votre mot de passe actuel.")
+            elif len(nouveau_mot_de_passe) < 8:
+                st.error("Le nouveau mot de passe doit contenir au moins 8 caractères.")
+            elif nouveau_mot_de_passe != confirmation_nouveau_mot_de_passe:
+                st.error("Les deux nouveaux mots de passe ne correspondent pas.")
+            elif not mode_reinitialisation and nouveau_mot_de_passe == mot_de_passe_actuel:
+                st.error("Le nouveau mot de passe doit être différent de l’actuel.")
+            else:
+                attributs = {"password": nouveau_mot_de_passe}
+                if not mode_reinitialisation:
+                    attributs["current_password"] = mot_de_passe_actuel
+                try:
+                    resultat_modification = client.auth.update_user(attributs)
+                except (AuthError, HTTPError) as erreur:
+                    st.error(f"Modification du mot de passe impossible : {erreur}")
+                else:
+                    if resultat_modification.user is None:
+                        st.error("Supabase n’a pas confirmé le changement de mot de passe.")
+                    else:
+                        st.session_state.pop("mode_reinitialisation_mdp", None)
+                        st.session_state.pop("mot_de_passe_actuel", None)
+                        st.session_state.pop("nouveau_mot_de_passe", None)
+                        st.session_state.pop("confirmation_nouveau_mot_de_passe", None)
+                        st.session_state.confirmation_securite = (
+                            "Votre mot de passe a été modifié."
+                        )
+                        st.session_state.page = "Tableau de bord"
+                        st.rerun()
