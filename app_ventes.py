@@ -374,8 +374,15 @@ def appliquer_style():
             background: #090b10;
             color: #f3f4f6;
         }
-        [data-testid="stHeader"] {
-            background: rgba(9, 11, 16, 0.92);
+        [data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stStatusWidget"],
+        [data-testid="stAppDeployButton"],
+        [data-testid="stHeaderActionElements"],
+        [data-testid="stFooter"],
+        #MainMenu,
+        footer {
+            display: none !important;
         }
         [data-testid="stSidebar"] {
             background: #10141c;
